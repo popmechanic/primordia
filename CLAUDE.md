@@ -51,7 +51,7 @@ primordia/
 ├── tsconfig.json / package.json / bun.d.ts / eslint.config.mjs / postcss.config.mjs
 ├── openapi-gen.config.json        ← OpenAPI spec generation config for the internal REST API
 │
-├── docs/                          ← Design notes and implementation strategy docs, including the Primordia CLI/Core extraction sketch
+├── docs/                          ← Design notes and implementation strategy docs, including the Primordia CLI/Core extraction sketch and the DoltLite data-versioning analysis
 ├── changelog/                     ← One .md file per change: YYYY-MM-DD-HH-MM-SS Description.md
 │   └── *.md                       ← Filename = short description; body = full what+why detail
 ├── scripts/                       ← Reverse proxy source, install script, worker processes — see .claude/rules/filemap-scripts.md
