@@ -65,18 +65,28 @@ Everything the agent did to data during the preview — including the very schem
 migration it developed and manually verified against the snapshot — is thrown away. The
 schema change then re-executes against real prod data on the new slot's first boot, at
 the only moment it has ever met that data. If the migration is wrong (drops a column,
-corrupts a backfill, deletes rows), it executes against the live DB with **no restore
-point**: the old slot's DB still exists, but nothing snapshots prod immediately
-pre-boot, and any writes after cutover live only in the damaged file. This is failure
-modes 1 and 3 in a single mechanism.
+corrupts a backfill, deletes rows), it executes against the live DB. A pre-migration
+restore point *does* incidentally exist at that moment — the old slot's DB file is left
+untouched by accept, and old slots accumulate indefinitely, so disk actually holds an
+unmanaged lineage of point-in-time prod snapshots. But it exists by accident, not by
+design: nothing surfaces it as a backup, no restore tooling targets it, and — see the
+next paragraph — the tools that do touch it destroy it. This is failure modes 1 and 3
+in a single mechanism.
 
-**Rollback deliberately rolls data forward.** Both rollback paths copy the *current*
-prod DB into the older slot before switching traffic, so users stay logged in and no
-accounts vanish. That is the right default for platform/auth data — but it means
-rollback can produce an incoherent pairing (old code + new-schema data), and it is
-exactly wrong for the case where the reason you are rolling back **is** the data damage.
-Today there is no way to express "restore yesterday's `orders` table but keep today's
-`sessions` table."
+**Rollback deliberately rolls data forward — and destroys the backup as it does so.**
+Both rollback paths copy the *current* prod DB into the older slot before switching
+traffic, so users stay logged in and no accounts vanish. That is the right default for
+platform/auth data — but it means rollback can produce an incoherent pairing (old code +
+new-schema data), and it is exactly wrong for the case where the reason you are rolling
+back **is** the data damage. Worse: that `copyDb` step **overwrites the old slot's
+pristine pre-damage DB with the damaged current data** — so the natural incident
+response to "the deploy corrupted my data" (roll back) permanently destroys the only
+pre-damage copy as its first action, with no archive taken. The other tool that touches
+the incidental backup lineage, server-health oldest-worktree cleanup, likewise deletes
+the slot's DB without archiving it (the session NDJSON log *is* archived; the DB is
+not). The system keeps accidental backups and both of its management tools destroy
+them. And there is no way to express "restore yesterday's `orders` table but keep
+today's `sessions` table."
 
 Finally, the agents themselves: evolve workers run with `bypassPermissions`
 (`scripts/claude-worker.ts:246-247`), receive **no prompt guidance about the database**,
@@ -280,13 +290,17 @@ this shape; only cross-process branch sharing is given up, and nothing in §3 ne
 Per the agreed posture, DoltLite must beat the best stock-SQLite alternative, not the
 status quo. What's achievable without it:
 
-1. **Pre-boot prod snapshot at accept + retained restore points.** One `VACUUM INTO` of
-   the old prod DB into a timestamped archive before the new slot boots (i.e., before
-   migrations run), retained alongside `productionHistory`. Closes the worst of failure
-   modes 1 and 3's *unrecoverability* — a restore point exists — at the cost of losing
-   all post-cutover writes on restore (all-or-nothing granularity). Roughly 20 lines in
-   `install.sh`. **This should happen regardless of any DoltLite decision.**
-2. **Archive session DBs like NDJSON logs** on reject/cleanup (they're already archived
+1. **Protect the restore points that already exist.** The old-slot DB files are already
+   a point-in-time backup lineage (§1) — the pre-migration state survives every accept
+   untouched. What's missing is not snapshot creation but snapshot *protection*: (a)
+   admin/CLI rollback must archive the target slot's DB (one `VACUUM INTO` to a
+   timestamped file) before `copyDb` clobbers it; (b) server-health cleanup must archive
+   a slot's DB before `worktree remove` deletes it, exactly as it already does for the
+   NDJSON log; (c) optionally, a timestamped archive at accept-cutover so restore points
+   survive independently of slot lifecycle. Closes the worst of failure modes 1 and 3's
+   *unrecoverability* at all-or-nothing granularity, for a few dozen lines across three
+   files. **This should happen regardless of any DoltLite decision.**
+2. **Archive session DBs like NDJSON logs** on reject (they're already archived
    for logs; the DB copy is currently just deleted).
 3. **Migration ledger** (ordered migration files + `schema_migrations` table) replacing
    ad-hoc boot-time try/catch. Enables "which migrations will run on accept" display and
@@ -329,12 +343,15 @@ trust in production-adjacent roles.
 ## 8. Recommendation: three phases
 
 **Phase 0 — Stock-SQLite hardening (do now; no new dependencies).**
-Pre-boot prod DB archive at accept; archive (not delete) session DBs on
-reject/cleanup; adopt a migration ledger. These are independently correct, close the
-unrecoverability hole this week, and are the refactors DoltLite integration would
-require anyway (single choke point for "copy the DB", migrations as data). Add a
-sentence to the agent prompt telling agents the DB is snapshot-isolated and that
-destructive data operations should be flagged in their summary.
+Stop destroying the incidental backups: archive the target slot's DB before rollback's
+`copyDb` overwrites it and before server-health cleanup deletes it; archive (not
+delete) session DBs on reject; add a timestamped prod archive at accept-cutover; adopt
+a migration ledger. These are independently correct, close the unrecoverability hole
+this week — mostly by *protecting restore points that already exist* rather than
+building new machinery — and are the refactors DoltLite integration would require
+anyway (single choke point for "copy the DB", migrations as data). Add a sentence to
+the agent prompt telling agents the DB is snapshot-isolated and that destructive data
+operations should be flagged in their summary.
 
 **Phase 1 — Validation spike (timeboxed, throwaway).**
 In a scratch worktree: `bun add @dolthub/doltlite`; run Primordia's schema + boot
